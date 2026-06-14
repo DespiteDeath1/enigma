@@ -8,6 +8,36 @@ not claim a new passing configuration.  It packages the fixed inputs, short
 window benchmarks, CADO command sweeps, and Granite Rapids profiling commands
 needed to re-test the hypotheses on the target machines.
 
+## Mission update: first stacked configuration to test
+
+The current best non-invasive Granite Rapids stack is:
+
+1. **Build on the grader, AVX2 only:** `-O3 -march=native -mno-avx512f
+   -mno-avx512vl -mno-avx512bw -mno-avx512dq -mprefer-vector-width=256`.
+   This keeps native Redwood Cove scheduling while avoiding the measured
+   heavy-512 frequency license.
+2. **Self-pin compactly:** the validator uses a CFS quota, not a cpuset, so
+   explicitly pin to one compact LLC/SNC group before launching CADO/`las`.
+3. **Exploit SMT deliberately:** test `-t 24,32,48` with the same 24-core quota.
+   This dependency-chain/branchy integer workload is a good SMT candidate.
+4. **Only then sweep relation floor:** `71M,66M,62M,60M` with the winning
+   build/thread/pinning choice.  Relation reduction is arch-neutral and stacks
+   only if GPU-LA/filter wall does not erase saved sieve time.
+
+Projected contribution to Intel wall, to be replaced by GNR measurements:
+
+| Lever | Expected Intel wall delta | Stacks? | Measurement gate |
+|---|---:|---|---|
+| Native AVX2-only GNR build vs shipped `icelake-server` tune | 3-8% | Yes | fixed `las` window, byte-identical relation gate |
+| Compact same-LLC/SNC pinning under `--cpus 24` | 0-8% | Yes | rel/s + migrations/context-switches |
+| SMT `-t 32` or `-t 48` under 24-core quota | 3-12% | Mostly | rel/s per wall, effective GHz |
+| Relation target 71M -> 60-66M | 5-12% | Yes, if GPU LA holds | end-to-end CADO+msieve GPU LA |
+| One-root cross-entry batch inversion patch | 0-7% | Yes | only if perf samples residual scalar path |
+
+The realistic path to >=20% is not one flag; it is build (3-8) + placement
+(0-8) + SMT (3-12) + relation floor (5-12), with source patches reserved for
+whatever `perf` proves remains hot.
+
 ## What I could re-verify in this repository
 
 - The live validator checks real factors.  `validate_breaking_rsa_solution`
@@ -19,26 +49,52 @@ needed to re-test the hypotheses on the target machines.
   factoring pipeline ending in msieve SIQS and is not expected to solve a
   generic 139-digit semiprime inside the milestone wall time.
 
-## Highest-priority measurement
+## Highest-priority measurement: build x pinning x SMT
 
-The most plausible lever from the brief is still the sieve-to-LA trade: cut
-Intel-bound relation collection and let the arch-neutral RTX PRO 6000 absorb a
-larger/denser matrix.  The baseline says Intel wall is about 293 min with
-~87-91% in sieving.  Dropping `rels_wanted` from 71M to 60M removes about 15.5%
-of nominal sieve work; 58M removes about 18.3%.  This only wins if GPU LA and
-filtering add less wall time than the saved sieve minutes, so it must be
-measured as an end-to-end run, not just a `las` rate.
+Use this before spending time on relation-floor or code patches:
+
+```bash
+CADO_SRC="$HOME/r460/cado-nfs" \
+BUILD_ROOT=/dev/shm/cado-builds \
+JOBS=24 \
+  workbench/research/rsa460/build_cado_variants.sh
+
+LAS_VARIANTS=(
+  "gcc-v3-icelake=/dev/shm/cado-builds/gcc-v3-icelake/sieve/las"
+  "gcc-native-no512=/dev/shm/cado-builds/gcc-native-no512/sieve/las"
+  "clang-v3-native-no512=/dev/shm/cado-builds/clang-v3-native-no512/sieve/las"
+)
+
+python3 -m workbench.research.rsa460.run_gnr_matrix \
+  --poly "$HOME/r460/c140.poly" \
+  --q0 11000000 --q1 11200000 \
+  --threads 24,32,48 \
+  --repeat 5 \
+  --out-dir /dev/shm/rsa460-gnr-matrix \
+  --las "${LAS_VARIANTS[0]}" \
+  --las "${LAS_VARIANTS[1]}" \
+  --las "${LAS_VARIANTS[2]}"
+```
+
+Pick the winner by `mean_relations_per_second_wall`, then profile that one
+with `profile_las_gnr.sh`.  Keep the raw `matrix-manifest.json` and each
+`*.summary.json`.
+
+If the host has several SNC/LLC groups, optionally force the first group by
+passing `--prefer-llc-cpu <cpu-id>` and repeat with one CPU from each LLC group.
+
+## Relation-floor / GPU-LA balance
 
 Run these first on Granite Rapids, using the exact c140 polynomial and the
 existing msieve GPU-LA bridge:
 
 ```bash
 # Fixed public benchmark instance; keep factors out of solver artifacts.
-python -m workbench.research.rsa460.generate_instance \
+python3 -m workbench.research.rsa460.generate_instance \
   --bits 460 --seed 42 --difficulty 460 --no-factors \
   --out /dev/shm/rsa460_seed42_public.json
 
-N="$(python - <<'PY'
+N="$(python3 - <<'PY'
 import json
 print(json.load(open('/dev/shm/rsa460_seed42_public.json'))['n'])
 PY
@@ -48,8 +104,9 @@ PY
 CADO="$HOME/r460/cado-nfs/cado-nfs.py"
 POLY="$HOME/r460/c140.poly"
 
-for rels in 71000000 66000000 62000000 60000000 58000000; do
-  python -m workbench.research.rsa460.cado_sweep \
+for rels in 71000000 66000000 62000000 60000000; do
+  python3 -m workbench.research.rsa460.pin_exec --compact 48 -- \
+  python3 -m workbench.research.rsa460.cado_sweep \
     --cado "$CADO" --poly "$POLY" --n "$N" \
     --label "gnr-c140def-rels-${rels}" \
     --work-dir "/dev/shm/gnr-c140def-rels-${rels}" \
@@ -60,7 +117,8 @@ done
 
 If the existing solver wrapper is required for msieve GPU-LA, use the same
 `rels_wanted` list in that wrapper instead of `cado_sweep.py`; keep the fixed
-N and record sieve, filter, LA, sqrt, and total wall.
+N and record sieve, filter, LA, sqrt, and total wall.  Do not project a pass
+from `las` rate alone; relation-floor changes must be end-to-end.
 
 ## Short `las` window A/B
 
@@ -72,7 +130,7 @@ on the measured cores.
 LAS="$HOME/r460/cado-nfs/build/sieve/las"
 POLY="$HOME/r460/c140.poly"
 
-python -m workbench.research.rsa460.las_window_bench \
+python3 -m workbench.research.rsa460.las_window_bench \
   --las "$LAS" --poly "$POLY" \
   --q0 11000000 --q1 11200000 \
   --threads 24 --repeat 5 \
@@ -83,7 +141,7 @@ python -m workbench.research.rsa460.las_window_bench \
 Use the same command for each CADO build variant.  Compare
 `mean_relations_per_second_wall` from the summary JSON files.
 
-Recommended build matrix:
+Recommended build matrix if you run manually instead of `build_cado_variants.sh`:
 
 1. GCC x86-64-v3 tuned for GNR:
    `-O3 -march=x86-64-v3 -mtune=graniterapids`
@@ -91,9 +149,8 @@ Recommended build matrix:
    `-O3 -march=x86-64-v4 -mtune=graniterapids`
 3. Clang x86-64-v3:
    `-O3 -march=x86-64-v3 -mtune=graniterapids`
-4. PGO on the `las` window:
-   build once with `-fprofile-generate`, run the fixed window, rebuild with
-   `-fprofile-use`.
+4. Native AVX2-only:
+   `-O3 -march=native -mno-avx512f -mno-avx512vl -mno-avx512bw -mno-avx512dq -mprefer-vector-width=256`
 
 Reject a build only after checking both relation rate and frequency.  A
 slower AVX-512 build may still show useful codegen in isolated functions; use
@@ -132,6 +189,25 @@ Decision rules:
   and port pressure are the likely Intel-specific levers.
 - **Frequency drops materially in v4/AVX-512 builds**: keep v3 for the final
   image unless a targeted light-AVX512 patch wins end-to-end.
+- **Residual `invmod_redc_32` under one-root transform paths**: implement and
+  test cross-entry batch inversion; see `SOURCE_AUDIT.md`.
+- **Mispredicts attributed to `push_update` capacity checks**: verify the
+  binary was not built with `SAFE_BUCKET_ARRAYS`; upstream production has no
+  per-update capacity branch there.
+
+## Source-audit findings to guide code patches
+
+See `SOURCE_AUDIT.md` for exact file/line-level findings.  In short:
+
+- CADO already has `batchinvredc_u32()` and uses it for simple entries with
+  two or more roots in the 31-bit normal-`las` path.
+- One-root simple entries and `fb_entry_general` remain scalar inversion paths;
+  these are the plausible patch targets if `perf` shows residual
+  `invmod_redc_32` there.
+- `SUPPORT_LARGE_Q` disables batch transforms, but normal `las` should not be
+  built with it for this workload.
+- Upstream production bucket push is branchless for capacity; if a profiler
+  shows an overflow/capacity branch, audit build macros or local patches.
 
 ## Full result table to fill in
 
