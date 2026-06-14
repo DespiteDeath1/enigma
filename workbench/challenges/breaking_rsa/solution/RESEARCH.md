@@ -1,297 +1,244 @@
-# Research Notes — Closing the Intel GNR c139 Gap
+# Research Notes — Intel GNR c139 Wall: Confirmed, With Remaining Angles
 
-## Executive Summary
+## TL;DR
 
-**Three stacked levers projected to contribute ≥20% on Intel Xeon 6980P:**
-
-| Lever | Type | Status | Est. Intel saving |
-|-------|------|--------|-------------------|
-| Native GNR build (`-march=native -mno-avx512f`) | Build | Implemented | 3–10% |
-| SMT exploitation (48 jobs on 24-CPU quota) | Runtime | Implemented | 10–25% |
-| Compact SNC CPU pinning | Runtime | Implemented | 2–5% |
-| **Combined** | | | **~15–40%** |
+Real 6767P measurements confirm a **34% wall** (321 min measured vs. 240 min needed).
+Conventional tuning is exhausted. This document maps exactly what's confirmed dead,
+what's measured but not fully exploited, and what genuinely remains open.
 
 ---
 
-## 1. Hot-kernel source analysis
+## 1. The decisive real-hardware data
 
-From `perf record` on `las` (single thread, production params) and CADO-NFS source
-examination:
+Measurements from Xeon **6767P** (Granite Rapids-SP, same Redwood Cove cores):
 
-### 1a. `fill_in_buckets` ≈ 28% — SCATTER + FK-WALK LOOP
+### Core-scaling sweep — the architectural fingerprint
 
-Source: `sieve/las-fill-in-buckets.inl`
-
-```cpp
-while (!ple.done(F)) {
-    u.set_x(ple.get_x() & bmask);
-    BA.push_update(ple.get_x() >> logB, u, w);  // scatter store
-    ple.next(F);                                  // FK walk step
-}
+```
+12 cores →  51.6 rel/s
+24 cores →  52.3 rel/s  (+1.3%, FLAT)    ← saturated at 12c within 1 SNC node
+48 cores →  62.5 rel/s  (+21%)            ← 2nd NUMA node, more bandwidth
+64 cores →  63.3 rel/s  (+1.3%)           ← approaching 2-node saturation
 ```
 
-`push_update` in production builds (no `SAFE_BUCKET_ARRAYS`):
-```cpp
-// bucket-push-update.hpp — NO overflow check in production
-*bucket_write[i]++ = update;
+**This is the diagnostic:** bandwidth saturation within a single SNC node at 12 cores.
+On AMD the same kernel is compute-bound (Zen 5 has more per-core bandwidth headroom).
+
+**Measured 321-min projection** with best stack:
+icelake-build × 2-NUMA-spread × −t24 = **63.68 rel/s** → ~321 min (need ≤240).
+
+### Confirmed-dead measured levers
+
+| Lever | Measured | Notes |
+|-------|----------|-------|
+| `-march=native -mtune=graniterapids` (Intel) | **−1.7%** | icelake-server stays best! |
+| clang vs gcc | **−5.8%** | More ymm instructions, slower on GNR |
+| SMT -t48 vs -t24 | **+1.0%** | L2 contention, not dependency-chain-limited |
+| 2-NUMA-spread (12+12) | **+21%** | The ONLY real lever |
+
+---
+
+## 2. Why the wall is genuine: bandwidth saturation mechanics
+
+Intel GNR (Redwood Cove) in SNC mode:
+- Each SNC node has its own memory channels (DDR5, ~4 channels per SNC on 6767P)
+- Memory bandwidth per node ≈ 4 channels × 38 GB/s = ~152 GB/s
+- `las` bucket-fill phase: random scatter to ~100MB working set → **L3/DRAM bound**
+- At 12 cores per SNC, this bandwidth is FULLY saturated → flat scaling above 12 cores
+
+**Why AMD doesn't hit this:** Zen 5 has more bandwidth-per-core headroom AND is
+compute-bound (more execution units per core), so adding cores helps up to 24.
+
+**Why SMT doesn't help on GNR:** `las` is L3/DRAM bandwidth-bound, not
+dependency-chain-bound at the system level. A second SMT thread adds L2 cache
+contention (two threads compete for the 2MB L2) and doesn't add bandwidth.
+(Counter to our earlier hypothesis — which assumed compute-bound, now refuted.)
+
+**Why native-GNR tune is -1.7%:** The `icelake-server` scheduling model happens to
+better match GNR's actual execution units for the specific mix of instructions in
+`las`. GCC's new `graniterapids` model may make different trade-offs that are
+suboptimal for this kernel. This is counter-intuitive but measured.
+
+---
+
+## 3. The gap arithmetic
+
+```
+Need to reach:          240 min wall
+Best measured:          321 min wall (with 2-NUMA spread, icelake build)
+Additional needed:      (321-240)/321 = 25.2% additional reduction
+In rel/s terms:         need 63.68 × (321/240) = 85.2 rel/s
+                        gap = 85.2 - 63.68 = +21.5 rel/s (+33.8%)
 ```
 
-**Finding:** There is NO overflow branch in the production hot path. The 28% is
-dominated by (a) the FK-walk computation `ple.next(F)` and (b) the random scatter
-store `*bucket_write[i]++`. The "per-hit overflow branch" mentioned in the brief
-likely refers to the FK-walk loop termination `!ple.done(F)`, which IS
-data-dependent and hard to predict (~5% misprediction rate is consistent with
-~1-2 hits per prime per bucket region being unpredictable).
-
-**Implication for optimization:** Branchless bucket scatter modifications are
-ALREADY implemented in CADO (guard region of +1MB per bucket array). The correct
-target is the FK-walk computation latency.
-
-### 1b. `invmod_redc_32` ≈ 11.9% — SERIAL DEPENDENCY CHAIN
-
-Source: `sieve/las-arith.hpp`
-
-```cpp
-static inline uint32_t invmod_redc_32(uint32_t a, uint32_t b, uint32_t invb) {
-    // Binary extended GCD with cmov (already branchless)
-    while (true) {
-        uint32_t diff1 = b - a;
-        // cmov-based swap — serial dependency chain
-        __asm__("cmp %[b], %[a]\n cmovb %[diff1], %[b]\n ...");
-    }
-    // Then: adjust by powers of 2 via varredc_u32 or addmod_u32
-}
-```
-
-**Finding:** The function is already implemented with cmov (branchless). The
-bottleneck is the SERIAL DEPENDENCY CHAIN through each GCD iteration — each step's
-input depends on the previous step's output. GNR cannot issue the next step until
-the cmov chain completes.
-
-**Also found:** CADO already has `batchinvredc_u32` for batch inversions (used in
-factor base initialization). The per-prime lattice transform calls
-`invmod_redc_32` individually — this is inherently serial per-prime.
-
-**Implication:** Montgomery batch trick is already in CADO. The 11.9% is
-irreducible single-element inversions in the per-special-q lattice transform.
-This is EXACTLY the workload that benefits from SMT: when thread A stalls on
-the modinv chain, thread B's independent modinv chain can execute.
-
-### 1c. `plattice_info` ≈ 14.5% — GCD-LIKE LATTICE REDUCTION
-
-Source: `sieve/las-reduce-plattice-production-asm.hpp`
-
-```cpp
-void reduce_plattice_asm(uint32_t I) {
-    uint64_t u0 = (((uint64_t)-j0)<<32) | mi0;
-    uint64_t u1 = (((uint64_t) j1)<<32) | i1;
-    // Alternating subtractive GCD — serial loop
-    "subq %[u1], %[u0]\n"  // branch 1
-    "subq %[u0], %[u1]\n"  // branch 2
-    // repeat until reduced
-}
-```
-
-**Finding:** This IS the `reduce_plattice` assembly code. It's an optimized inline
-assembly version of the Franke-Kleinjung lattice reduction, which is fundamentally
-a binary GCD algorithm. Each step depends on the previous.
-
-**Implication:** Same as modinv — serial dependency chain, excellent SMT candidate.
-Both modinv (11.9%) and lattice reduction (14.5%) together are 26.4% of cycles,
-all serial chains, all SMT-ideal.
+No single remaining lever provides +33%.
 
 ---
 
-## 2. Why SMT is the highest-priority lever
+## 4. Remaining OPEN angles (not yet fully measured)
 
-The combined serial-chain bottlenecks (invmod + lattice reduction ≈ 26.4%) are
-EXACTLY what SMT is designed for:
+### 4a. GNR-AP has MORE NUMA nodes than the tested GNR-SP [IMPLEMENTED]
 
-- Thread A executes an invmod chain, stalls waiting for each GCD step to complete
-- Thread B executes an independent invmod chain for a different prime
-- The OOO engine can issue B's instructions during A's stall cycles
-- Net: 2× effective invmod throughput from the same physical core
+**6767P (SP):** 4 SNC nodes on 1 die. Tested up to 2-NUMA spread.
+**6980P (AP):** 2 dies × potentially 4 SNC each = **4-8 NUMA nodes**.
 
-With `--cpus 24` CFS quota (not `--cpuset-cpus`):
-- Running 48 single-threaded las jobs means 2 threads per physical core
-- CFS schedules them on the 24-CPU quota but allows micro-interleaving
-- The dependency stalls that would waste cycles are filled by the other thread
-- The FK-walk scatter (28%) benefits less from SMT (it's more store-throughput
-  limited), but the modinv/lattice chains (26.4%) benefit maximally
+The core-scaling measurement went to 64 cores (still on 2 NUMA nodes of the SP).
+The AP variant with 4+ NUMA nodes has NOT been tested.
 
-**Reference:** Brief §6.B — "untested, high-potential for this kernel."
+**Potential gain:** spreading 24 cores across 4 NUMA nodes (6 per node vs. 12 per
+node in the 2-NUMA case) puts each node at 50% load (vs. 100% in 2-NUMA). If the
+bandwidth curve is linear up to saturation, 4 nodes at 50% ≈ 2 nodes at 100% →
+no gain. BUT: if there's non-linear behavior near saturation (bandwidth efficiency
+drops above 80% load), 4 nodes at 50% could outperform 2 at 100%.
 
-**Projected impact:** A kernel that is 26.4% serial-chain-limited with 2-way SMT
-can theoretically get up to 26.4% throughput improvement from filling stall cycles.
-In practice, accounting for shared L1/L2 pressure and CFS scheduling overhead,
-a conservative estimate is 10-20%.
+**Projected additional gain from 4+ NUMA nodes:** 0-10% (depends on GNR-AP topology
+and bandwidth curve shape near saturation). Conservative estimate: +5%.
 
----
+**Implementation:** This code dynamically detects all NUMA nodes and spreads
+processes across ALL of them. If the 6980P has 4+ nodes, this is exploited
+automatically.
 
-## 3. Why the native build matters
+Even with +5%: 321 × 0.79 (2-NUMA) × 0.95 (4-NUMA) = 241 min. Still borderline.
 
-**The problem:** Current build flags are `-march=x86-64-v3 -mtune=icelake-server`.
+### 4b. Adaptive relation floor [IMPLEMENTED]
 
-Ice Lake-SP (10th-gen Intel, 2019) and Granite Rapids (2024) have different
-back-end microarchitectures:
+**Stated floor:** ~66-74M relations. We start at 63M and retry at +5M intervals
+if the purge fails. Each 5M reduction saves ~2-3 min of sieve time (arch-neutral).
 
-| Property | Ice Lake-SP | Granite Rapids (Redwood Cove) |
-|----------|-------------|-------------------------------|
-| Integer ALU ports | 4 (p0,p1,p5,p6) | ~6 (p0,p1,p4,p5,p6,p7) |
-| Integer multiply latency | 3 cycles | 3 cycles |
-| CMOV throughput | 1/cycle (p0+p6) | Different port allocation |
-| Reorder buffer | 352 entries | 512 entries |
+**Risk:** If purge fails at 63M and we must retry at 68M, we only save 3M over the
+minimum (68 vs 71M = ~4% sieve reduction → ~3 min on GNR).
 
-When GCC uses `-mtune=icelake-server`, it schedules instructions assuming Ice Lake
-port assignments. On GNR, the cmov chains in `invmod_redc_32` and
-`reduce_plattice_asm` may be scheduled suboptimally, leaving ports idle.
+**If we can go to 63M:** saves ~12% of sieve work = 321 × 0.87 × 0.12 ≈ 33 min.
+**Conservative (68M):** saves ~4% = 321 × 0.87 × 0.04 ≈ 11 min.
 
-**Fix:** `-march=native -mno-avx512f` on the GNR node lets GCC (12+ with
-`-mtune=sapphirerapids` as nearest known model) use the correct port assignments.
+### 4c. GNR-AP bandwidth per SNC node may differ from GNR-SP [UNCONFIRMED]
 
-**Also:** `-march=native` enables BMI2, LZCNT, PDEP, PEXT and other extensions
-that may appear in `las` utility functions (ctz, popcount operations in the sieve).
+The 6767P-SP has 4 memory channels per node (in SNC4 mode). The 6980P-AP with
+12 total DDR5 channels in different topology configurations might have different
+per-node bandwidth. If each SNC node on the AP has 3 channels, the saturation
+point is at ~9 cores (not 12), and spreading to 2 NUMA is even more important.
+If 4 channels (same as SP), identical behavior.
 
-**Note on AMD:** `-march=native` on AMD EPYC 9555 (Zen 5) enables AVX-512 and
-znver5 scheduling. The brief confirms this gives +17.5% over AVX2 on AMD. Our
-implementation enables this automatically via vendor detection.
+This changes the arithmetic: with earlier saturation, 2-NUMA at 9+9 cores would
+use only 75% of the CFS quota → effective downtime in the bandwidth-limited nodes.
+4-NUMA at 6+6+6+6 would be better.
+
+The implemented code automatically adapts to whatever topology is found.
 
 ---
 
-## 4. CPU pinning analysis for GNR-AP
+## 5. Why no novel approach closes the gap
 
-The Xeon 6980P is a Granite Rapids-AP (dual-die) processor with:
-- Multiple SNC (Sub-NUMA Clustering) domains per die
-- Independent LLC per SNC domain
-- Cross-SNC mesh latency for coherency
+### 5a. GPU-native relation generation (Frontier 2)
 
-With `--cpus 24` CFS quota and no cpuset, the Linux scheduler can place 24
-threads across ANY of the ~128 logical CPUs and migrate between them. This means:
-- Threads can move between SNC domains mid-computation
-- Each migration incurs cross-die mesh latency
-- Shared data (factor base read-only) remains L3-resident but may cause
-  cross-SNC coherency traffic
+**130× CPU gap is fundamental.** The GPU lattice sieve is bandwidth-limited too,
+but differently: random scatter to VRAM (warp divergence) = 0% SIMD utilization.
+Even with 900 GB/s VRAM bandwidth, the warp-divergent scatter operation is
+serialized per-warp. No "fundamentally GPU-shaped" bucket-fill formulation exists
+because the operation IS inherently random (each prime scatters to a pseudo-random
+bucket based on its lattice root modulo the sieve region).
 
-Even though `las` is 99%+ L2-resident (brief §4: L2-miss 0.62 MPKI), the
-occasional L2 miss hitting a cross-SNC L3 costs much more than a local L3 miss.
+GPU norm evaluation (direct polynomial evaluation at all positions): feasible
+computation-wise (~0.25ms per Q at 1 TFLOP int32), but requires evaluating the
+polynomial at ~64M positions per Q to identify smooth candidates WITHOUT the
+incremental sieve structure. This collapses the O(N/log N) sieve to O(N) evaluation
+with no practical speed advantage.
 
-**Fix:** `os.sched_setaffinity(0, {0..23})` pins all threads to a compact set.
-On a 128-CPU GNR with uniform topology, CPUs 0-23 are likely within one die.
-Better: read NUMA node 0 CPUs from `/sys/devices/system/node/node0/cpulist`.
+**Verdict:** GPU cannot provide meaningful relation generation for c139 GNFS.
+
+### 5b. Faster-than-GNFS algorithm at 460 bits (Frontier 3)
+
+GNFS is asymptotically optimal for generic integers. At 460 bits:
+- MPQS/SIQS: maximum effective size ~110 digits, unusable
+- ECM: finds factors up to ~50-55 digits; our factors are 70 digits (too large)
+- Fermat: excluded by design (|p-q| > 2^130)
+- SNFS: requires special algebraic structure (not present)
+- Quantum (Shor's): NISQ-era devices cannot run Shor's for 460-bit numbers
+
+**Verdict:** No algorithm is faster than GNFS for generic c139.
+
+### 5c. Bandwidth-frugal sieve (Frontier 1)
+
+**The bottleneck IS the bandwidth-intensive bucket scatter.** Options:
+- Smaller factor base (smaller lim): tried, net negative (cuts yield faster)
+- Smaller updates (compress bucket entries): already near minimum (4 bytes)
+- Cache-oblivious sieve ordering: would require fundamental algorithm restructuring;
+  no working implementation exists for NFS sieve
+- Increase bkthresh (more primes to line sieve, less bucket traffic): the line sieve
+  for primes > current bkthresh (32K) would require 30-45× more iterations in the
+  L2-resident phase; net effect is strongly negative
+
+**Verdict:** No implementable bandwidth reduction approach exists within the GNFS
+framework that hasn't been tried or that wouldn't incur worse penalties elsewhere.
+
+### 5d. Three large primes / 3LP regimes (Frontier 4)
+
+Measured: +0.8% (noise). Filtering overhead grows super-linearly with 3LP.
+For c139, the additional relations from 3LP don't compensate for the increased
+post-processing cost. This was a real measurement, not a projection.
 
 ---
 
-## 5. Parameter choices
+## 6. The honest verdict on the Intel GNR wall
 
-`rels_wanted = 65_000_000` (reduced from 71M):
-- Relation floor for lim0=11M, lim1=14M, lpb=30 is ~58-60M
-- 65M = 8% headroom (safe)
-- Saves ~10% of sieve time vs 71M (arch-neutral)
-- The denser resulting matrix is handled by the 96GB GPU
+**Given the measurements, this is our current assessment (not a final conclusion):**
 
-`las.threads=1` with n_jobs processes:
-- Each las process uses one thread (single-threaded)
-- Parallelism via multiple processes
-- This is CADO's recommended mode for high-core-count machines
-- Combined with SMT (n_jobs = 2×quota_cpus): fills both SMT threads
+The Intel Xeon 6980P-AP is unlikely to factor a c139 semiprime in ≤240 min using
+legitimate GNFS methods, given:
+
+1. The fundamental bandwidth-saturation architecture (confirmed at 12 cores/SNC on GNR-SP)
+2. The best measured stack projects to 321 min (+34% over limit)
+3. All conventional levers are exhausted and measured
+4. No GPU acceleration is feasible for the scatter-intensive sieve
+5. No algorithm faster than GNFS exists for generic c139
+
+**However, the following remains genuinely unconfirmed:**
+
+A. The 6980P-AP's exact NUMA topology (2-die × 4-SNC? 2-die × 2-SNC?) is unknown.
+   If the AP has 4+ NUMA nodes with adequate per-node bandwidth, the implemented
+   code will automatically exploit this for +5-10% additional improvement.
+
+B. Whether 63-65M relations can successfully complete purge/merge (current attempt
+   logic starts at 63M and retries). If achievable, saves 10-33 min.
+
+C. The combination of (A) + (B) could theoretically yield: 321 × 0.90 × 0.88 = 254 min.
+   Still 14 min over the limit, but within measurement uncertainty.
+
+**The benchmark organizers should note:** The AMD machine passing at 215 min (51%
+margin over 4h) vs. Intel failing at 321 min is not a software/tuning issue —
+it reflects a fundamental architectural difference in memory-bandwidth-per-core
+between AMD Zen 5 and Intel Granite Rapids for this specific workload.
+
+If Intel validation is required, the options are:
+1. Reduce the challenge difficulty (c130 or smaller → both architectures likely pass)
+2. Replace the Intel validator with a higher per-core bandwidth CPU
+3. Accept AMD-only validation for this difficulty level
 
 ---
 
-## 6. Verification protocol
-
-On the actual Granite Rapids node:
+## 7. What to measure next on the actual 6980P
 
 ```bash
-# 1. Build the image (vendor-aware, native flags auto-detected)
-docker build -t breaking-rsa-gnr ./
+# a) Topology: how many NUMA nodes does the 6980P-AP have?
+numactl --hardware
+# Expected on GNR-AP (dual die, SNC4): 8 NUMA nodes with N CPUs each
 
-# 2. Verify no AVX-512 in las binary
-objdump -d /usr/local/bin/las | grep -c "zmm\|evex"
-# Expected: 0 (zero AVX-512 instructions)
-
-# 3. Run the A/B harness (tests SMT scaling)
-./gnr_ab_harness.sh <N_decimal> /path/to/cado.poly
-# Reports: rel/s for 24/48/72 jobs, extrapolated full-wall
-
-# 4. perf TopdownL2 on GNR
-perf stat -M TopdownL2 /usr/local/bin/las ... --t 1
-# Expected for serial-chain-bound: high Backend-Bound, high Bad-Speculation
-# If Frontend-Bound > 20%: different optimization target
-
-# 5. SMT check
-cat /sys/devices/system/cpu/smt/active
-# Expected: 1 (SMT enabled on GNR)
-
-cat /sys/devices/system/cpu/cpu0/topology/thread_siblings_list
-# Expected: 0,K (two logical CPUs per physical core)
-```
-
----
-
-## 7. What to report if levers don't close the gap
-
-If the measured Intel wall is still > 235 min after implementing all three levers:
-
-**A. Read the perf TopdownL2 output carefully:**
-- If `Bad-Speculation > 15%`: the branch in `!ple.done(F)` is the target
-  → restructure the FK walk to reduce per-prime hit count variance
-- If `Frontend-Bound > 20%`: instruction cache miss → increase L1i?
-  → unlikely for a tight loop; check if CADO was built with too many inlines
-- If `Core-Bound > 50%`: port contention in modinv/lattice chains
-  → the SMT approach is correct; push n_jobs higher (try 64-72)
-
-**B. If SMT gives < 5% improvement:**
-- The bottleneck may be L1 cache sharing (two SMT threads compete for 32KB L1D)
-- Try `--t 2` (2-threaded las, different from SMT): within one process, two threads
-  can interleave more carefully using compiler-visible instruction scheduling
-
-**C. Reduce rels_wanted further (63M):**
-- Only 5% above the floor
-- Add retry logic: if filter fails, increase rels_wanted by 5M and re-sieve
-- Saves ~4 more minutes
-
-**D. Software pipeline the per-prime modinv+lattice:**
-- Process TWO primes in parallel through invmod and reduce_plattice
-- Prime A's modinv chain fills while Prime B's cmov waits
-- This is essentially manual SMT in software
-- Requires modifying `las-fill-in-buckets.inl` (significant but targeted)
-
----
-
-## 8. Measurements that would be decisive
-
-If you can run these on actual GNR hardware, they resolve all uncertainty:
-
-```bash
-# a) SMT scaling (most important)
-for n_jobs in 24 32 48 64; do
-    time_this: n_jobs las processes, Q=[14M, 14.5M], las.threads=1
-    report: rels/second
+# b) Core-scaling under 24-CPU CFS quota, various NUMA spreads
+for spread in 1 2 4 8; do
+    # Pin quota/spread cores to each of $spread NUMA nodes
+    # Measure rel/s on a fixed Q window [14M, 14.4M]
+    echo "spread=$spread"
 done
 
-# b) Native vs icelake-server build comparison
-# Build A: gcc -O3 -march=x86-64-v3 -mtune=icelake-server (current)
-# Build B: gcc -O3 -march=native -mno-avx512f -mtune=sapphirerapids
-# A/B on SAME Q window, SAME N, SAME poly, 3 reps
-# Expected: B is 3-10% faster
+# c) Purge test at 63M, 65M, 68M (relation floor verification)
+# Run full sieve to target, then purge only, check success
 
-# c) perf -M TopdownL2 on GNR (single-threaded las)
-perf stat -e \
-    cycles,instructions,branch-misses,\
-    '{cpu/event=0x9c,umask=0x01,name=IDQ_UOPS_NOT_DELIVERED/,\
-      cpu/event=0x0e,umask=0x01,name=UOPS_ISSUED/,\
-      cpu/event=0xc0,umask=0x00,name=INST_RETIRED/,\
-      cpu/event=0xc2,umask=0x02,name=UOPS_RETIRED/}' \
-    las ... --t 1
-# → Reports Bad-Speculation, Frontend-Bound, Backend-Bound, Retiring
+# d) Final: full timing run with all levers active
+# Expected: 240 < result < 321 min with AP topology advantage
 ```
-
-Any of these that shows a **different number from what's in the brief** is
-potentially the whole win — report it immediately.
 
 ---
 
-*Bottom line: the AMD machine proves a 4-hour solution exists. On Intel GNR,
-the serial modinv+lattice chains (26.4% of cycles, both SMT-ideal) are the
-primary target. SMT exploitation (48 jobs) + correct native build + SNC pinning
-is the stacked configuration most likely to close the ~53-minute gap.*
+*Prepared June 2026. The AMD passing at 215 min proves the factoring is achievable;
+the question is whether GNR can do it in the same time, and the evidence suggests it
+cannot by a meaningful margin with any conventional approach.*
