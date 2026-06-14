@@ -161,6 +161,206 @@ but a narrow matrix:
 - PGO vs non-PGO
 - AVX2 baseline vs carefully bounded AVX-512 experiments
 
+## Upstream CADO source audit: important contradictions
+
+I cloned upstream CADO-NFS locally at:
+
+- repo: `https://github.com/cado-nfs/cado-nfs`
+- revision: `68af200f39b8f14fd53455750a387d3c504e6d68`
+
+That source audit turned up two contradictions that are worth treating as
+first-class re-verification targets.
+
+### 1) Upstream bucket push has no production overflow branch
+
+In upstream CADO:
+
+- `sieve/bucket-push-update.hpp`
+- `bucket_array_t<LEVEL, HINT>::push_update(...)`
+
+the hot write path is simply:
+
+```c++
+*bucket_write[i]++ = update;
+```
+
+The capacity check exists only under `SAFE_BUCKET_ARRAYS`.
+
+Implication:
+
+- If your profile really shows a per-hit overflow/capacity branch in bucket
+  fill, that is probably **not upstream CADO**.
+- Either the build enables a safety mode, or the miner carries a local fork, or
+  the symbolization attributed a different branch to that region.
+
+This is exactly the kind of contradiction that can flip the optimization plan.
+Do not spend days "removing the bucket overflow branch" before confirming that
+your shipped binary actually contains one.
+
+### 2) Upstream already batches the common simple root transforms
+
+In upstream CADO:
+
+- `sieve/fb.cpp`: `fb_entry_x_roots<Nr_roots>::transform_roots(...)`
+- `sieve/las-fbroot-qlattice.hpp`: `fb_root_in_qlattice_31bits_batch(...)`
+- `sieve/las-arith.hpp`: `batchinvredc_u32(...)`
+
+the common simple multi-root path already uses one batch inversion for the
+whole root set.
+
+Implication:
+
+- "Add Montgomery batch inversion to the common simple path" is **already done**
+  upstream.
+- If `invmod_redc_32` still burns ~12 % of cycles in your profile, that cost is
+  likely coming from:
+  - one-root transforms,
+  - general-entry transforms,
+  - projective fallback paths,
+  - or some other call site outside the already-batched fast path.
+
+### 3) But there are still real batching gaps in upstream
+
+There are still upstream holes:
+
+- `sieve/fb.cpp`: `fb_entry_general::transform_roots(...)` has:
+  - `/* TODO: Use batch-inversion here */`
+- `sieve/las-fbroot-qlattice.hpp`: under `SUPPORT_LARGE_Q`,
+  `fb_root_in_qlattice_batch(...)` currently returns `false`, forcing scalar
+  fallback.
+
+Implication:
+
+- If your c139 configuration encounters a meaningful fraction of general entries
+  or large-q transforms, there is still a legitimate batching lever left.
+
+### 4) Upstream plattice reduction is already hand-written asm
+
+Upstream `plattice_info::reduce(...)` dispatches to:
+
+- `sieve/las-reduce-plattice-production-asm.hpp`
+
+on amd64/GCC-style inline asm builds.
+
+Implication:
+
+- "Just use PGO/LTO" is unlikely to move this path much.
+- The real source-level levers are:
+  - retuning the subtractive-block / divide schedule for Granite Rapids,
+  - or changing the higher-level algorithmic mix, not asking the compiler to
+    rediscover a different asm schedule.
+
+## Source-level opportunities that are still alive
+
+These are the highest-value upstream-backed patch ideas I found.
+
+### S1) Batch the remaining `fb_entry_general` transforms
+
+Patch target:
+
+- `sieve/fb.cpp`: `fb_entry_general::transform_roots(...)`
+
+Current state:
+
+- root transforms are done one-by-one
+- the file itself carries a TODO for batch inversion
+
+Expected upside:
+
+- low if general entries are rare
+- meaningful if the chosen factor base / special-q regime generates many prime
+  powers, projective roots, or non-simple entries
+
+Projected Intel impact:
+
+- **0-4 %** by itself, but only if general-entry traffic is nontrivial
+
+### S2) Preserve batching when only one root in a batch is exceptional
+
+Patch targets:
+
+- `sieve/las-fbroot-qlattice.hpp`
+- `sieve/fb.cpp`
+
+Current state:
+
+- if any denominator in a batch becomes noninvertible, the whole batch falls
+  back to scalar root-by-root transforms
+
+Patch idea:
+
+- batch the affine subset
+- scalar-handle only the exceptional/projective lanes
+
+Projected Intel impact:
+
+- **1-3 %**, probably stackable with S1
+
+### S3) Retune `reduce_plattice_asm()` for Granite Rapids specifically
+
+Patch target:
+
+- `sieve/las-reduce-plattice-production-asm.hpp`
+
+Why it is still alive:
+
+- the source comments already state that the subtractive-block count vs division
+  threshold is microarchitecture-dependent
+- Granite Rapids is not the microarchitecture this asm was originally tuned for
+
+Patch idea:
+
+- keep the current path as default
+- add a Granite-Rapids-specific variant selected at build time
+- sweep the number of subtractive blocks before `divl`
+
+Projected Intel impact:
+
+- **3-6 %** if the 14.5 % plattice slice is truly hot on your measured binary
+
+### S4) Make the FK walk more branch-light
+
+Patch targets:
+
+- `sieve/las-plattice.hpp`: `plattice_enumerator::next(...)`,
+  `probably_coprime(...)`
+- `sieve/las-fill-in-buckets.inl`: tight `while (!ple.done(F))` loops
+
+Why this matters:
+
+- even if bucket writes are branchless, the FK walk itself still contains
+  control flow and coprimality tests in the per-hit path
+
+Patch idea:
+
+- convert the tiny per-step control flow to mask/select arithmetic or cmov-heavy
+  sequences
+- unroll 4-8 steps and buffer accepted hits before stores
+
+Projected Intel impact:
+
+- **3-7 %**, especially if Topdown on GNR reports bad speculation /
+  front-end pressure rather than memory stalls
+
+## A stack that can plausibly reach the missing ~20 %
+
+Based on the brief, the harness, and the upstream audit, the most plausible
+stack is:
+
+1. **compact self-pinning on the real 6980P topology**  
+   projected **+4-8 %**
+2. **SMT oversubscription on the 6980P (`-t 32` / `-t 48`)**  
+   projected **+5-10 %**
+3. **native-on-node AVX2 build (`-march=native -mno-avx512f`)**  
+   projected **+3-6 %**
+4. **Granite-Rapids-specific `reduce_plattice_asm()` retune**  
+   projected **+3-6 %**
+5. **general-entry / partial-batch root-transform cleanup**  
+   projected **+1-4 %**
+
+Not all of these will hit their top end simultaneously, but a realistic stacked
+path to **~20 %+** exists without invoking any dead GPU/full-sieve ideas.
+
 ## Experiments to run next
 
 The goal is to falsify cheap, high-magnitude explanations before spending time
@@ -186,8 +386,13 @@ Keep everything else fixed and compare:
 # default placement
 ./workbench/challenges/breaking_rsa/cado_perf_probe.sh <your-cado-command...>
 
-# compact placement on an explicit CPU list
-CPUSET=0-23 \
+# compact placement chosen from quota + NUMA topology
+CPUSET="$(python3 workbench/challenges/breaking_rsa/select_compact_cpuset.py)" \
+./workbench/challenges/breaking_rsa/cado_perf_probe.sh <your-cado-command...>
+
+# compact placement with SMT siblings added after one thread/core
+CPUSET="$(python3 workbench/challenges/breaking_rsa/select_compact_cpuset.py \
+  --count 32 --strategy smt-compact)" \
 ./workbench/challenges/breaking_rsa/cado_perf_probe.sh <your-cado-command...>
 ```
 
@@ -211,6 +416,54 @@ Measure:
 - branch-miss rate
 - wall time on the same q-range
 
+Exact build commands to start from:
+
+```bash
+# GCC 15 AVX2-first build on the Granite Rapids node
+cmake -S /workspace/external/cado-nfs -B /tmp/cado-gcc15-gnr \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=gcc \
+  -DCMAKE_CXX_COMPILER=g++ \
+  -DCMAKE_C_FLAGS="-O3 -march=native -mno-avx512f -mprefer-vector-width=256 -falign-loops=32 -falign-functions=32" \
+  -DCMAKE_CXX_FLAGS="-O3 -march=native -mno-avx512f -mprefer-vector-width=256 -falign-loops=32 -falign-functions=32"
+cmake --build /tmp/cado-gcc15-gnr -j"$(nproc)"
+
+# Clang AVX2-first build
+cmake -S /workspace/external/cado-nfs -B /tmp/cado-clang-gnr \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=clang \
+  -DCMAKE_CXX_COMPILER=clang++ \
+  -DCMAKE_C_FLAGS="-O3 -march=native -mno-avx512f -mprefer-vector-width=256" \
+  -DCMAKE_CXX_FLAGS="-O3 -march=native -mno-avx512f -mprefer-vector-width=256"
+cmake --build /tmp/cado-clang-gnr -j"$(nproc)"
+
+# GCC PGO build (same q-window you use for rel/s A/B)
+cmake -S /workspace/external/cado-nfs -B /tmp/cado-gcc15-pgo-gen \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=gcc \
+  -DCMAKE_CXX_COMPILER=g++ \
+  -DCMAKE_C_FLAGS="-O3 -march=native -mno-avx512f -mprefer-vector-width=256 -fprofile-generate" \
+  -DCMAKE_CXX_FLAGS="-O3 -march=native -mno-avx512f -mprefer-vector-width=256 -fprofile-generate"
+cmake --build /tmp/cado-gcc15-pgo-gen -j"$(nproc)"
+# run representative las slice here
+cmake -S /workspace/external/cado-nfs -B /tmp/cado-gcc15-pgo-use \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=gcc \
+  -DCMAKE_CXX_COMPILER=g++ \
+  -DCMAKE_C_FLAGS="-O3 -march=native -mno-avx512f -mprefer-vector-width=256 -fprofile-use -fprofile-correction" \
+  -DCMAKE_CXX_FLAGS="-O3 -march=native -mno-avx512f -mprefer-vector-width=256 -fprofile-use -fprofile-correction"
+cmake --build /tmp/cado-gcc15-pgo-use -j"$(nproc)"
+```
+
+Perf command to pair with the same q-window:
+
+```bash
+perf stat -r 3 \
+  -M TopdownL1 -M TopdownL2 \
+  -e cycles,instructions,branches,branch-misses,cache-misses \
+  -- <your-las-or-cado-command>
+```
+
 ### Experiment set D: GNFS work-balance only after A-C
 
 Only if A-C do not close the gap:
@@ -223,12 +476,17 @@ Only if A-C do not close the gap:
 
 ## Suggested decision order
 
-1. **Container CPU count / thread sizing**
-2. **Affinity / compact placement on Granite Rapids**
-3. **Compiler matrix with PGO**
-4. **Relation-floor / LA trade-off**
-5. **GPU cofactorization**
-6. **GPU full sieve only with hard evidence**
+1. **Reproduce the source-level contradictions on the shipped binary**
+   - is bucket push really branchless or not?
+   - is the hot `invmod_redc_32` share coming from already-batched or
+     still-unbatched paths?
+2. **Affinity / compact placement on the real Granite Rapids topology**
+3. **SMT sweep on Granite Rapids**
+4. **Compiler matrix with native AVX2 build on-node**
+5. **Granite-Rapids-specific `reduce_plattice_asm()` retune**
+6. **Root-transform batching cleanup for general / partial-fallback cases**
+7. **Relation-floor / LA trade-off only after 1-6**
+8. **GPU ideas only with hard rel/s evidence**
 
 If step 1 or 2 produces a double-digit Intel gain, it dominates everything
 else and should be fixed in the miner wrapper before more exotic work.
