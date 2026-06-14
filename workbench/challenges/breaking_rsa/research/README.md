@@ -21,8 +21,13 @@ It is designed for the exact hostile setup in the brief:
   Builds baseline and Granite-focused CADO variants (gcc/clang/icx).
 - `project_wall.py`  
   Projects Intel/AMD full wall from measured throughput deltas.
+- `independent_wall_bound.py`  
+  Computes required extra sieve gain from current best Intel wall to 240 min.
 - `audit_cado_hotpath.py`  
   Source audit for key hypotheses (batch inversion use, overflow checks, etc.).
+- `apply_cado_breakthrough_patch.sh` + `patches/cado-force-no-resieve.patch`  
+  Experimental structural change: force hintless/no-resieve path and pair with
+  batch cofactorization.
 - `intel_gap_matrix.example.json`  
   Minimal starter matrix.
 - `granite_perf_matrix.example.json`  
@@ -78,6 +83,43 @@ Expected outcomes to confirm/disprove assumptions:
 These two checks are critical because they can invalidate entire optimization
 stories before spending benchmark hours.
 
+## Breakthrough candidate: forced hintless sieve + batch cofactorization
+
+### Why this is structurally different
+
+Conventional tuning touched flags/placement/SMT, but this changes the memory
+shape of `las` itself:
+
+- normal resieve path uses larger bucket updates (`shorthint_t`/`longhint_t`)
+- hintless path uses `emptyhint_t`/`logphint_t`, cutting update size roughly
+  2x on active levels (`bucket_update_t<1,shorthint_t>` is 4 bytes vs
+  `bucket_update_t<1,emptyhint_t>` 2 bytes; similarly 8->4 at level 2/3)
+- this can materially reduce memory traffic in fill/downsort phases on
+  bandwidth-bound Granite Rapids nodes
+
+### Patch and test
+
+```bash
+# apply patch into your cado checkout
+./workbench/challenges/breaking_rsa/research/apply_cado_breakthrough_patch.sh \
+  /home/ubuntu/r460/cado-nfs
+
+# rebuild variants
+./workbench/challenges/breaking_rsa/research/build_cado_variants.sh \
+  /home/ubuntu/r460/cado-nfs /home/ubuntu/r460
+
+# run matrix entry:
+#   force-no-resieve-batch-t24
+```
+
+Patch behavior:
+- adds `CADO_FORCE_NO_RESIEVE=1` env override in `siever_config::needs_resieving()`
+- requires running with `tasks.sieve.las.batch=true` (already enforced in matrix)
+
+Risk:
+- more work in cofactor/batch path; may regress if survivor-side work explodes.
+- must pass your byte-identical correctness gate.
+
 ## Practical stack to pursue for >=20% Intel cut
 
 Target is cumulative, not single-lever:
@@ -92,6 +134,14 @@ Target is cumulative, not single-lever:
    `tasks.sieve.las.batch=true` (+ batchlpb/mfb) and
    `tasks.sieve.allow_compsq=true`.
 5. **Re-validate relation floor assumptions** only after steps 1-4.
+
+Use `independent_wall_bound.py` to quantify remaining required gain from current
+best:
+
+```bash
+python3 workbench/challenges/breaking_rsa/research/independent_wall_bound.py \
+  --intel-best-wall 321 --target-wall 240 --baseline-rel 52.3 --best-rel 63.68
+```
 
 ## Reporting template
 

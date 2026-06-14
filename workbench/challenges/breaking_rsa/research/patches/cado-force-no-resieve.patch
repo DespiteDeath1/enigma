@@ -1,0 +1,33 @@
+diff --git a/sieve/las-siever-config.hpp b/sieve/las-siever-config.hpp
+index 8f5f819..8f5f819 100644
+--- a/sieve/las-siever-config.hpp
++++ b/sieve/las-siever-config.hpp
+@@ -1,6 +1,7 @@
+ #ifndef CADO_LAS_SIEVER_CONFIG_HPP
+ #define CADO_LAS_SIEVER_CONFIG_HPP
+ 
++#include <cstdlib>
+ #include <cstring>
+ 
+ #include <algorithm>
+@@ -113,6 +114,17 @@ struct siever_config {
+      * "fraction of a tiny fraction" effect. BUT we still have some
+      * interest in removing known primes from the norms, as we do in the
+      * "normal" (= nowhere batch) case.
++     *
++     * Experimental override:
++     *   if CADO_FORCE_NO_RESIEVE=1 in the environment, return false here
++     *   even when lim>0 on all sides.
++     *
++     * This intentionally forces the hintless bucket path (empty/logp hints),
++     * reducing bucket update size (e.g. 4B->2B at level 1).
++     * It must be paired with batch cofactorization mode.
+      */
+     bool needs_resieving() const {
++        if (const char *e = std::getenv("CADO_FORCE_NO_RESIEVE")) {
++            if (*e == '1')
++                return false;
++        }
+         for(auto const & s : sides)
+             if (s.lim == 0)
+                 return false;

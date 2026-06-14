@@ -82,6 +82,15 @@
       }
     },
     {
+      "name": "force-no-resieve-batch-t24",
+      "repeat": 3,
+      "command": "CADO_FORCE_NO_RESIEVE=1 {PIN24_SMT} -- {PERF} -- python3 {CADO_BIN}/cado-nfs.py {N} tasks.polyselect.import={POLY} {BASE} {QWIN_A} tasks.threads=24 tasks.sieve.las.batch=true tasks.batchlpb0=28 tasks.batchlpb1=28 tasks.batchmfb0=62 tasks.batchmfb1=62",
+      "metrics": {
+        "rels_per_sq": "(?P<value>[0-9]+(?:\\.[0-9]+)?)r/sq",
+        "sec_per_rel": "(?P<value>[0-9]+(?:\\.[0-9]+)?)s/r"
+      }
+    },
+    {
       "name": "composite-specialq-t24",
       "repeat": 3,
       "command": "{PIN24_SMT} -- {PERF} -- python3 {CADO_BIN}/cado-nfs.py {N} tasks.polyselect.import={POLY} {BASE} {QWIN_A} tasks.threads=24 tasks.sieve.allow_compsq=true tasks.sieve.qfac_min=50 tasks.sieve.qfac_max=100000",
