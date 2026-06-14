@@ -54,8 +54,7 @@ for rels in 71000000 66000000 62000000 60000000 58000000; do
     --label "gnr-c140def-rels-${rels}" \
     --work-dir "/dev/shm/gnr-c140def-rels-${rels}" \
     --rels-wanted "$rels" \
-    --target-density 125 \
-    --extra-param tasks.sieve.dup=false
+    --target-density 125
 done
 ```
 

@@ -12,10 +12,18 @@ import json
 from pathlib import Path
 from typing import Any
 
-from qbittensor.challenges.breaking_rsa import BreakingRSA
-
 
 def generate_instance(bits: int, seed: int, difficulty: int) -> dict[str, Any]:
+    try:
+        from qbittensor.challenges.breaking_rsa import BreakingRSA
+    except ModuleNotFoundError as exc:
+        if exc.name == "gmpy2":
+            raise SystemExit(
+                "Missing dependency gmpy2. Install repository requirements before "
+                "generating benchmark instances: python3 -m pip install -r requirements.txt"
+            ) from exc
+        raise
+
     challenge = BreakingRSA(difficulty=difficulty, num_bits=bits)
     problem, verif = challenge.generate(seed)
     p = int(verif.p)
