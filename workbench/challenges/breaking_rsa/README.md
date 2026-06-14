@@ -25,9 +25,21 @@ Solutions are executed by validators under these conditions:
 - **Network:** None (`--network none`, no internet access)
 - **Platform:** `linux/amd64`
 - **Compute:** NVIDIA RTX PRO 6000 (96 GB VRAM), 24 vCPU, 85 GB RAM
+- **CPU limit semantics:** validators currently enforce the CPU budget with `docker run --cpus 24` (CFS quota). This is *not* the same as `--cpuset-cpus`: inside the container, `os.cpu_count()` may still report the host's full CPU count and threads may migrate across the host topology unless your solver sets affinity itself.
 - **Filesystem:** Root filesystem is read-only. Use `/tmp` (tmpfs, currently sized to `VALIDATOR_DOCKER_TMPFS_DEFAULT` with noexec/nosuid) for any scratch space, temp files, or working directories needed at runtime.
 - **User:** Runs as a non-root user (default `miner`). Your Dockerfile should create this user and ensure your solver and any required binaries are accessible to it (see the example_solution/Dockerfile).
 - **Output contract:** In Docker/validator mode there is **no** writable `/output` volume mounted. Your solver must emit results exclusively via the stdout protocol (text logs, then the `SOLUTION_OUTPUT_SEPARATOR` line, then a base64-encoded zip of `result.json` + `solve_info.json` etc.). See `enigma_challenges/solution_output.py` (or the vendored copy at build time). The `OUTPUT_DIR` environment variable is only provided in direct (non-Docker) mode for local development convenience.
+
+### CPU-budget guidance for solver authors
+
+If your miner is CPU-bound, size worker pools from cgroup quota and/or process affinity rather than trusting `os.cpu_count()` alone. On Linux containers the most reliable order is:
+
+1. cgroup v2 quota: `/sys/fs/cgroup/cpu.max`
+2. cgroup v1 quota: `/sys/fs/cgroup/cpu/cpu.cfs_quota_us` and `cpu.cfs_period_us`
+3. `os.sched_getaffinity(0)` / `taskset` / `sched_setaffinity`
+4. `os.cpu_count()` only as a bare-metal fallback
+
+For topology-sensitive workloads such as GNFS sieving, consider explicitly pinning long-running worker threads or subprocesses to a compact CPU set so the kernel does not spread them across distant NUMA / LLC domains.
 
 ## Challenge parameters
 

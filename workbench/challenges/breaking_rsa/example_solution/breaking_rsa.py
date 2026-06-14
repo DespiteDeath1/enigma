@@ -74,6 +74,65 @@ def _printlog(msg: str) -> None:
     print(line, flush=True)
 
 
+def _read_text_if_exists(path: str) -> Optional[str]:
+    try:
+        return Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+
+
+def _effective_cpu_count() -> int:
+    """
+    Estimate usable CPU parallelism inside containers.
+
+    The validator applies ``docker run --cpus 24`` which is a CFS quota, not a
+    cpuset. ``os.cpu_count()`` may therefore report the full host topology
+    rather than the miner's actual budget. We take the minimum of:
+      - scheduler affinity (cpuset-aware when present)
+      - cgroup v2 CPU quota
+      - cgroup v1 CPU quota
+      - host-visible CPU count (fallback)
+    """
+    counts: list[int] = []
+
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            affinity_count = len(os.sched_getaffinity(0))
+        except OSError:
+            affinity_count = 0
+        if affinity_count > 0:
+            counts.append(affinity_count)
+
+    cpu_max = _read_text_if_exists("/sys/fs/cgroup/cpu.max")
+    if cpu_max:
+        parts = cpu_max.split()
+        if len(parts) >= 2 and parts[0] != "max":
+            try:
+                quota = int(parts[0])
+                period = int(parts[1])
+            except ValueError:
+                quota = 0
+                period = 0
+            if quota > 0 and period > 0:
+                counts.append(max(1, math.ceil(quota / period)))
+
+    quota_text = _read_text_if_exists("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
+    period_text = _read_text_if_exists("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
+    if quota_text and period_text:
+        try:
+            quota = int(quota_text)
+            period = int(period_text)
+        except ValueError:
+            quota = 0
+            period = 0
+        if quota > 0 and period > 0:
+            counts.append(max(1, math.ceil(quota / period)))
+
+    host_count = os.cpu_count() or 1
+    counts.append(host_count)
+    return max(1, min(counts))
+
+
 # ---------------------------------------------------------------------------
 # Stage 1a: Trial division
 # ---------------------------------------------------------------------------
@@ -482,11 +541,15 @@ def factor_semiprime(n: int, num_bits: int, log=None) -> tuple[Optional[int], Op
     Returns (p, q, method_used) or (None, None, "failed").
     """
     n_digits = len(str(n))
-    num_cpus = os.cpu_count() or 4
+    host_cpus = os.cpu_count() or 1
+    num_cpus = _effective_cpu_count()
 
     if log:
         log(f"Factoring {num_bits}-bit ({n_digits}-digit) semiprime")
-        log(f"Available CPUs: {num_cpus}")
+        if num_cpus != host_cpus:
+            log(f"Available CPUs: effective={num_cpus}, host_visible={host_cpus}")
+        else:
+            log(f"Available CPUs: {num_cpus}")
 
     # Stage 1a: Trial division
     if log:
