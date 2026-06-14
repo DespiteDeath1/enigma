@@ -1,5 +1,11 @@
 # RSA-460 / c139 CADO-NFS research harness
 
+> **Current status after real 6767P measurements:** conventional build,
+> pinning, SMT, relation-floor, and source hot-loop tuning did not close the
+> gap.  See `WALL_CONFIRMATION.md` for the current deliverable: an independent
+> wall confirmation plus the one remaining quantified structural falsification
+> test (packed bucket-update traffic).
+
 This directory contains reproducibility helpers for the c139/RSA-460
 investigation described in the research brief.  The checked-in workbench does
 not contain the private CADO-NFS image, tuned `c140.poly`, msieve GPU linear
@@ -8,9 +14,13 @@ not claim a new passing configuration.  It packages the fixed inputs, short
 window benchmarks, CADO command sweeps, and Granite Rapids profiling commands
 needed to re-test the hypotheses on the target machines.
 
-## Mission update: first stacked configuration to test
+## Historical note: pre-6767P stacked configuration
 
-The current best non-invasive Granite Rapids stack is:
+The following was the first non-invasive stack to test before the user's real
+6767P measurements.  It is preserved for reproducibility, but the new data says
+these levers are measured-dead or insufficient.
+
+The tested stack was:
 
 1. **Build on the grader, AVX2 only:** `-O3 -march=native -mno-avx512f
    -mno-avx512vl -mno-avx512bw -mno-avx512dq -mprefer-vector-width=256`.
@@ -24,7 +34,7 @@ The current best non-invasive Granite Rapids stack is:
    build/thread/pinning choice.  Relation reduction is arch-neutral and stacks
    only if GPU-LA/filter wall does not erase saved sieve time.
 
-Projected contribution to Intel wall, to be replaced by GNR measurements:
+Pre-measurement projected contribution, now superseded:
 
 | Lever | Expected Intel wall delta | Stacks? | Measurement gate |
 |---|---:|---|---|

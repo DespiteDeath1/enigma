@@ -1,5 +1,13 @@
 # CADO `las` hot-path source audit for RSA-460
 
+> **Superseded by later 6767P measurements.** This audit identified possible
+> scalar-inversion and bucket-branch checks.  The user has since verified on
+> the production binary that multi-root batch inversion is active, the
+> `fb_entry_general` hole is only 74 / 575,664 c139 factor-base entries, bucket
+> push is branchless with `SAFE_BUCKET_ARRAYS` off, and plattice is already
+> hand-written amd64 ASM.  See `WALL_CONFIRMATION.md` for the current
+> conclusion.
+
 Audited upstream CADO-NFS source revision:
 `68af200f39b8f14fd53455750a387d3c504e6d68`.
 
