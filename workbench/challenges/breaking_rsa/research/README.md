@@ -1,92 +1,108 @@
-# RSA-460 Intel Gap Research Kit
+# RSA-460 Granite Rapids Campaign Kit
 
-This directory contains a reproducible A/B harness for narrowing the Intel
-Granite Rapids gap on the c139 (~460-bit) GNFS workload.
+This directory is an execution-focused kit for closing the Intel Granite Rapids
+gap on c139 GNFS by stackable, measurable changes.
 
-## What this kit does
+It is designed for the exact hostile setup in the brief:
+- Docker `--cpus 24` quota (not cpuset),
+- full-host CPU visibility from inside the container,
+- need to self-pin to avoid cross-domain migration,
+- compare by `las` throughput first, then project full wall.
 
-- Runs a matrix of controlled experiments (same N, same poly, fixed q-window).
-- Captures per-run logs and wall-time.
-- Extracts throughput metrics (for example `r/sq` and `s/r`) with regex.
-- Emits machine-readable `results.json` + `results.csv`.
-- Computes percent delta against a declared baseline metric.
+## Included tools
 
-This does **not** assume one specific CADO layout; it executes whatever command
-you put in the matrix.
+- `run_matrix.py`  
+  Generic matrix runner. Executes commands, collects logs, extracts metrics,
+  emits `results.json`/`results.csv`.
+- `affinity_exec.py`  
+  Executes a command pinned to either **compact** or **spread** CPU sets
+  (with optional SMT siblings) from inside the container.
+- `build_cado_variants.sh`  
+  Builds baseline and Granite-focused CADO variants (gcc/clang/icx).
+- `project_wall.py`  
+  Projects Intel/AMD full wall from measured throughput deltas.
+- `audit_cado_hotpath.py`  
+  Source audit for key hypotheses (batch inversion use, overflow checks, etc.).
+- `intel_gap_matrix.example.json`  
+  Minimal starter matrix.
+- `granite_perf_matrix.example.json`  
+  Granite-focused matrix with perf + pinning + SMT + batch/compsq toggles.
 
-## Files
-
-- `run_matrix.py` - generic matrix runner.
-- `intel_gap_matrix.example.json` - starter matrix you should edit.
-
-## Usage
+## High-value command sequence (Granite node)
 
 ```bash
-cd /workspace
+# 1) Build variants
+./workbench/challenges/breaking_rsa/research/build_cado_variants.sh \
+  /home/ubuntu/r460/cado-nfs /home/ubuntu/r460
+
+# 2) Verify key source assumptions quickly
+python3 workbench/challenges/breaking_rsa/research/audit_cado_hotpath.py \
+  --cado-src /home/ubuntu/r460/cado-nfs
+
+# 3) Edit matrix vars: N, poly path, baseline build path
+$EDITOR workbench/challenges/breaking_rsa/research/granite_perf_matrix.example.json
+
+# 4) Run matrix
 python3 workbench/challenges/breaking_rsa/research/run_matrix.py \
-  --matrix workbench/challenges/breaking_rsa/research/intel_gap_matrix.example.json \
+  --matrix workbench/challenges/breaking_rsa/research/granite_perf_matrix.example.json \
   --out-dir workbench/challenges/breaking_rsa/research/matrix_runs
+
+# 5) Project full walls from rel/sq deltas
+python3 workbench/challenges/breaking_rsa/research/project_wall.py \
+  --csv workbench/challenges/breaking_rsa/research/matrix_runs/<ts>/results.csv \
+  --baseline-name baseline-unpinned-t24 \
+  --metric rels_per_sq \
+  --intel-baseline-min 293 \
+  --amd-baseline-min 215 \
+  --sieve-fraction 0.89
 ```
 
-Outputs are written under:
+## Important source-level hypothesis checks (already encoded)
 
-`workbench/challenges/breaking_rsa/research/matrix_runs/<timestamp>/`
+Run:
+```bash
+python3 workbench/challenges/breaking_rsa/research/audit_cado_hotpath.py \
+  --cado-src /tmp/cado-nfs
+```
 
-## Measurement protocol (important)
+Expected outcomes to confirm/disprove assumptions:
 
-1. **Fix the problem instance** (`N`) for all A/B runs.
-2. **Fix the polynomial** (`c140.poly`) for all A/B runs.
-3. **Use at least two q-windows** (`QWIN_A`, `QWIN_B`) to avoid local bias.
-4. **Compare by throughput first** (for example `rels_per_sq`), then project to
-   full wall.
-5. Keep CPU pinning and thermal state stable between runs.
+1. `batch_inversion_used_in_fbroot_transform == true`  
+   CADO already calls `batchinvredc_u32` in `las-fbroot-qlattice.hpp` for
+   batched root transforms.
+2. `bucket_push_has_overflow_check_only_in_SAFE_BUCKET_ARRAYS == true` and
+   `bucket_hot_write_is_plain_store == true`  
+   In normal builds, bucket hot write path is `*bucket_write[i]++ = update;`
+   with no overflow branch unless safety macros are enabled.
 
-## High-priority hypotheses to test first
+These two checks are critical because they can invalidate entire optimization
+stories before spending benchmark hours.
 
-These are ranked by potential to recover double-digit Intel wall-time:
+## Practical stack to pursue for >=20% Intel cut
 
-1. **Codegen/profile mismatch on Intel**
-   - Compare GCC/Clang/icx builds with explicit `-march=x86-64-v3`.
-   - Keep AVX-512 disabled unless it wins on measured q-window throughput.
-   - Add a PGO pass for `las` on Intel-only.
+Target is cumulative, not single-lever:
 
-2. **Thread-count/frequency knee**
-   - Sweep `tasks.threads` in `{24,22,20,18}`.
-   - If Intel all-core frequency rises enough at lower thread count, total
-     throughput can improve despite fewer workers.
+1. **Build/codegen** (Granite-native AVX2, avoid AVX-512 downclock):  
+   compare `build-gcc-v3-icelake` vs `build-gcc-native-avx2` vs clang/icx.
+2. **Placement** (compact pinning in quota-only container):  
+   unpinned vs compact vs spread.
+3. **SMT throughput knee** (dependency-chain + branchy kernel):  
+   sweep `tasks.threads=24,32,48` with compact+SMT pinning.
+4. **Batch/cofactor split and composq**:
+   `tasks.sieve.las.batch=true` (+ batchlpb/mfb) and
+   `tasks.sieve.allow_compsq=true`.
+5. **Re-validate relation floor assumptions** only after steps 1-4.
 
-3. **Batch cofactorization split**
-   - Test `tasks.sieve.las.batch=true` with tuned `batchlpb*`, `batchmfb*`.
-   - Goal: reduce expensive CPU-side per-survivor work and shift to batched
-     post-processing.
+## Reporting template
 
-4. **Composite special-q**
-   - Test `tasks.sieve.allow_compsq=true` with bounded `qfac_min/qfac_max`.
-   - Validate `rels/sq` and CPU cost, not just raw relation count.
+For each experiment row:
+- rels/sq delta vs baseline (%),
+- branch miss and Topdown shifts (if available),
+- projected Intel wall (min),
+- projected AMD wall (min),
+- stackability verdict (yes/no, with dependency).
 
-5. **Relation-floor pressure**
-   - Test lower `tasks.sieve.rels_wanted` and compensate by relaxing filter
-     constraints only as much as needed for successful LA.
-
-## Suggested Intel-vs-AMD reporting format
-
-For each experiment:
-
-- `rels_per_sq` (or equivalent throughput metric).
-- `delta_vs_baseline_pct`.
-- projected sieve wall contribution.
-- projected full wall under your current sieve/LA split.
-
-Then report:
-
-- best **single config** that keeps AMD <4h and Intel <4h,
-- and second-best fallback if first fails stability checks.
-
-## Notes on CADO parameters used in the matrix template
-
-- `tasks.sieve.las.batch=true` enables batch cofactorization mode in `las`.
-- `tasks.batchlpb0/1`, `tasks.batchmfb0/1` are accepted by `las` and CADO's
-  cadofactor wrappers.
-- `tasks.sieve.allow_compsq=true` enables composite special-q mode.
-
-All of these should still be validated on your local CADO checkout/version.
+Promote only configurations that:
+- are reproducible across at least 3 repeats/window,
+- preserve correctness,
+- keep projected Intel < 240 and AMD < 240 (prefer <235 safety).

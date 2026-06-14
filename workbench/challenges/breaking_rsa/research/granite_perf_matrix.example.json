@@ -1,0 +1,94 @@
+{
+  "default_cwd": "/home/ubuntu/r460",
+  "vars": {
+    "N": "PUT_RSA460_INTEGER_HERE",
+    "POLY": "/home/ubuntu/r460/c140.poly",
+    "QWIN_A": "tasks.sieve.qmin=45000000 tasks.sieve.qrange=80000",
+    "BASE": "tasks.lim0=11000000 tasks.lim1=14000000 tasks.lpb0=30 tasks.lpb1=30 tasks.mfb0=60 tasks.mfb1=60 tasks.I=13 tasks.sieve.rels_wanted=71000000 tasks.filter.target_density=125",
+    "PERF": "perf stat -x, -e cycles,instructions,branches,branch-misses,task-clock,cpu-clock -M TopdownL1",
+    "PIN24": "python3 /workspace/workbench/challenges/breaking_rsa/research/affinity_exec.py --mode compact --threads 24",
+    "PIN24_SMT": "python3 /workspace/workbench/challenges/breaking_rsa/research/affinity_exec.py --mode compact --threads 24 --smt",
+    "PIN32_SMT": "python3 /workspace/workbench/challenges/breaking_rsa/research/affinity_exec.py --mode compact --threads 32 --smt",
+    "PIN48_SMT": "python3 /workspace/workbench/challenges/breaking_rsa/research/affinity_exec.py --mode compact --threads 48 --smt",
+    "PIN24_SPREAD": "python3 /workspace/workbench/challenges/breaking_rsa/research/affinity_exec.py --mode spread --threads 24",
+    "CADO_BIN": "/home/ubuntu/r460/cado-nfs/build-gcc-native-avx2"
+  },
+  "baseline_name": "baseline-unpinned-t24",
+  "primary_metric": "rels_per_sq",
+  "experiments": [
+    {
+      "name": "audit-cado-hotpath",
+      "command": "python3 /workspace/workbench/challenges/breaking_rsa/research/audit_cado_hotpath.py --cado-src /home/ubuntu/r460/cado-nfs",
+      "metrics": {
+        "batchinv_symbol": "\"batch_inversion_symbol_present\": true",
+        "batchinv_used": "\"batch_inversion_used_in_fbroot_transform\": true",
+        "bucket_safe_check_only": "\"bucket_push_has_overflow_check_only_in_SAFE_BUCKET_ARRAYS\": true"
+      }
+    },
+    {
+      "name": "baseline-unpinned-t24",
+      "repeat": 3,
+      "command": "{PERF} -- python3 {CADO_BIN}/cado-nfs.py {N} tasks.polyselect.import={POLY} {BASE} {QWIN_A} tasks.threads=24",
+      "metrics": {
+        "rels_per_sq": "(?P<value>[0-9]+(?:\\.[0-9]+)?)r/sq",
+        "sec_per_rel": "(?P<value>[0-9]+(?:\\.[0-9]+)?)s/r",
+        "branch_miss_ratio_pct": "(?P<value>[0-9]+(?:\\.[0-9]+)?),.*branch-misses",
+        "instructions": "(?P<value>[0-9]+(?:\\.[0-9]+)?),.*,instructions"
+      }
+    },
+    {
+      "name": "compact-pin-t24",
+      "repeat": 3,
+      "command": "{PIN24} -- {PERF} -- python3 {CADO_BIN}/cado-nfs.py {N} tasks.polyselect.import={POLY} {BASE} {QWIN_A} tasks.threads=24",
+      "metrics": {
+        "rels_per_sq": "(?P<value>[0-9]+(?:\\.[0-9]+)?)r/sq",
+        "sec_per_rel": "(?P<value>[0-9]+(?:\\.[0-9]+)?)s/r"
+      }
+    },
+    {
+      "name": "spread-pin-t24",
+      "repeat": 3,
+      "command": "{PIN24_SPREAD} -- {PERF} -- python3 {CADO_BIN}/cado-nfs.py {N} tasks.polyselect.import={POLY} {BASE} {QWIN_A} tasks.threads=24",
+      "metrics": {
+        "rels_per_sq": "(?P<value>[0-9]+(?:\\.[0-9]+)?)r/sq",
+        "sec_per_rel": "(?P<value>[0-9]+(?:\\.[0-9]+)?)s/r"
+      }
+    },
+    {
+      "name": "compact-pin-smt-t32",
+      "repeat": 3,
+      "command": "{PIN32_SMT} -- {PERF} -- python3 {CADO_BIN}/cado-nfs.py {N} tasks.polyselect.import={POLY} {BASE} {QWIN_A} tasks.threads=32",
+      "metrics": {
+        "rels_per_sq": "(?P<value>[0-9]+(?:\\.[0-9]+)?)r/sq",
+        "sec_per_rel": "(?P<value>[0-9]+(?:\\.[0-9]+)?)s/r"
+      }
+    },
+    {
+      "name": "compact-pin-smt-t48",
+      "repeat": 3,
+      "command": "{PIN48_SMT} -- {PERF} -- python3 {CADO_BIN}/cado-nfs.py {N} tasks.polyselect.import={POLY} {BASE} {QWIN_A} tasks.threads=48",
+      "metrics": {
+        "rels_per_sq": "(?P<value>[0-9]+(?:\\.[0-9]+)?)r/sq",
+        "sec_per_rel": "(?P<value>[0-9]+(?:\\.[0-9]+)?)s/r"
+      }
+    },
+    {
+      "name": "batch-cofac-t24",
+      "repeat": 3,
+      "command": "{PIN24_SMT} -- {PERF} -- python3 {CADO_BIN}/cado-nfs.py {N} tasks.polyselect.import={POLY} {BASE} {QWIN_A} tasks.threads=24 tasks.sieve.las.batch=true tasks.batchlpb0=28 tasks.batchlpb1=28 tasks.batchmfb0=62 tasks.batchmfb1=62",
+      "metrics": {
+        "rels_per_sq": "(?P<value>[0-9]+(?:\\.[0-9]+)?)r/sq",
+        "sec_per_rel": "(?P<value>[0-9]+(?:\\.[0-9]+)?)s/r"
+      }
+    },
+    {
+      "name": "composite-specialq-t24",
+      "repeat": 3,
+      "command": "{PIN24_SMT} -- {PERF} -- python3 {CADO_BIN}/cado-nfs.py {N} tasks.polyselect.import={POLY} {BASE} {QWIN_A} tasks.threads=24 tasks.sieve.allow_compsq=true tasks.sieve.qfac_min=50 tasks.sieve.qfac_max=100000",
+      "metrics": {
+        "rels_per_sq": "(?P<value>[0-9]+(?:\\.[0-9]+)?)r/sq",
+        "sec_per_rel": "(?P<value>[0-9]+(?:\\.[0-9]+)?)s/r"
+      }
+    }
+  ]
+}

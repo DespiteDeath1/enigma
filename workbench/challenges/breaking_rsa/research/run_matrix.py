@@ -78,6 +78,7 @@ def _run_one(
     matrix_vars: dict[str, str],
     default_cwd: Path,
     out_dir: Path,
+    run_suffix: str = "",
 ) -> RunResult:
     name = exp["name"]
     command_template = exp["command"]
@@ -87,7 +88,8 @@ def _run_one(
     env.update({str(k): str(v) for k, v in exp.get("env", {}).items()})
 
     started = time.perf_counter()
-    log_file = out_dir / f"{name}.log"
+    safe_suffix = run_suffix.replace("/", "_")
+    log_file = out_dir / f"{name}{safe_suffix}.log"
     with log_file.open("w", encoding="utf-8") as f:
         f.write(f"# name: {name}\n")
         f.write(f"# cwd: {cwd}\n")
@@ -113,6 +115,40 @@ def _run_one(
         exit_code=proc.returncode,
         duration_s=duration_s,
         log_file=str(log_file),
+        metrics=metrics,
+    )
+
+
+def _aggregate_runs(name: str, runs: list[RunResult]) -> RunResult:
+    if not runs:
+        raise ValueError("cannot aggregate empty runs")
+    numeric_keys: set[str] = set()
+    for r in runs:
+        for k, v in r.metrics.items():
+            if isinstance(v, (int, float)):
+                numeric_keys.add(k)
+    metrics: dict[str, Any] = {}
+    for k in sorted({kk for r in runs for kk in r.metrics.keys()}):
+        vals = [r.metrics.get(k) for r in runs]
+        nums = [float(v) for v in vals if isinstance(v, (int, float))]
+        if nums and len(nums) == len(runs):
+            metrics[k] = sum(nums) / len(nums)
+            metrics[f"{k}_min"] = min(nums)
+            metrics[f"{k}_max"] = max(nums)
+        else:
+            # Keep last non-null textual value as an annotation.
+            text = None
+            for v in vals:
+                if v is not None:
+                    text = v
+            metrics[k] = text
+    return RunResult(
+        name=name,
+        command=runs[0].command,
+        cwd=runs[0].cwd,
+        exit_code=max(r.exit_code for r in runs),
+        duration_s=sum(r.duration_s for r in runs),
+        log_file=";".join(r.log_file for r in runs),
         metrics=metrics,
     )
 
@@ -207,16 +243,36 @@ def main() -> int:
     results: list[RunResult] = []
     for exp in matrix["experiments"]:
         name = exp["name"]
-        print(f"=== Running: {name} ===")
+        repeat = int(exp.get("repeat", 1))
+        print(f"=== Running: {name} (repeat={repeat}) ===")
         print(f"Command: {exp['command']}")
         if exp.get("cwd"):
             print(f"CWD: {exp['cwd']}")
-        result = _run_one(exp, matrix_vars, default_cwd, out_dir)
-        print(
-            f"Done: {name} (exit={result.exit_code}, "
-            f"duration={result.duration_s:.2f}s, log={result.log_file})"
-        )
-        results.append(result)
+        trial_results: list[RunResult] = []
+        for i in range(repeat):
+            suffix = f"__run{i+1}" if repeat > 1 else ""
+            result = _run_one(exp, matrix_vars, default_cwd, out_dir, run_suffix=suffix)
+            print(
+                f"Done: {name}{suffix} (exit={result.exit_code}, "
+                f"duration={result.duration_s:.2f}s, log={result.log_file})"
+            )
+            trial_results.append(result)
+            # Keep per-trial rows for reproducibility and noise bars.
+            if repeat > 1:
+                trial_row = RunResult(
+                    name=f"{name}__run{i+1}",
+                    command=result.command,
+                    cwd=result.cwd,
+                    exit_code=result.exit_code,
+                    duration_s=result.duration_s,
+                    log_file=result.log_file,
+                    metrics=result.metrics,
+                )
+                results.append(trial_row)
+        if repeat > 1:
+            results.append(_aggregate_runs(name, trial_results))
+        else:
+            results.append(trial_results[0])
 
     _write_results(results, out_dir, primary_metric, baseline_name)
     return 0
