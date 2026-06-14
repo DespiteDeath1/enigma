@@ -1,0 +1,52 @@
+# CADO-NFS parameter file for c139-c141 numbers (~460-bit balanced semiprimes)
+# Tuned for Intel Xeon 6980P (Granite Rapids) with 24 cores + RTX PRO 6000 GPU.
+#
+# Key tuning decisions vs. CADO defaults:
+#
+#   rels_wanted = 65_000_000  (default ~71M)
+#     The relation floor for this factor base is ~58-60M unique.
+#     65M = 8% headroom. Saves ~10% of sieve time on Intel vs. 71M.
+#     The denser resulting matrix is handled by the 96GB GPU VRAM.
+#
+#   target_density = 125
+#     Standard value; well-tested with msieve GPU block-Lanczos.
+#     Could go to 150 if the matrix is too large for GPU memory
+#     (unlikely with 96GB VRAM).
+#
+#   I = 13  (not 14)
+#     The sieve is compute-bound (IPC ~2.1, not memory-latency bound).
+#     I=14 doubles the sieve region memory but doesn't help an IPC-bound kernel.
+#
+#   lim0 = 11_000_000, lim1 = 14_000_000
+#     These give ~25M total primes in the factor base.
+#     Matrix dimension after filtering: ~20-25M columns.
+#     Tested: AMD EPYC 9555 passes at ~215 min with these values.
+
+tasks.lim0 = 11000000
+tasks.lim1 = 14000000
+tasks.lpb0 = 30
+tasks.lpb1 = 30
+tasks.mfb0 = 60
+tasks.mfb1 = 60
+tasks.ncurves0 = 17
+tasks.ncurves1 = 29
+tasks.I = 13
+tasks.qrange = 500000
+tasks.rels_wanted = 65000000
+tasks.target_density = 125
+
+# Polynomial selection parameters
+# admin range chosen to find Murphy-E >= 1.0e-6 in ~12 min on 24 cores
+tasks.polyselect.admin = 120
+tasks.polyselect.admax = 1800
+tasks.polyselect.incr = 60
+tasks.polyselect.P = 3200000
+tasks.polyselect.degree = 5
+
+# Linear algebra (CADO's own bwc — override with msieve GPU for speed)
+tasks.linalg.bwc.m = 64
+tasks.linalg.bwc.n = 64
+
+# Square root: try first 10 dependency vectors before declaring failure
+tasks.sqrt.first_dep = 1
+tasks.sqrt.n_dep = 10
