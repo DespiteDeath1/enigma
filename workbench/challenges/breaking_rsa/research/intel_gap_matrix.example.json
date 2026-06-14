@@ -1,0 +1,59 @@
+{
+  "default_cwd": "/home/ubuntu/r460",
+  "vars": {
+    "N": "PUT_RSA460_INTEGER_HERE",
+    "POLY": "/home/ubuntu/r460/c140.poly",
+    "BASE_SIEVE_OVERRIDES": "tasks.lim0=11000000 tasks.lim1=14000000 tasks.lpb0=30 tasks.lpb1=30 tasks.I=13 tasks.sieve.rels_wanted=71000000 tasks.filter.target_density=125",
+    "QWIN_A": "tasks.sieve.qmin=45000000 tasks.sieve.qrange=80000",
+    "QWIN_B": "tasks.sieve.qmin=65000000 tasks.sieve.qrange=80000"
+  },
+  "baseline_name": "baseline-gcc-v3-qwin-a",
+  "primary_metric": "rels_per_sq",
+  "experiments": [
+    {
+      "name": "baseline-gcc-v3-qwin-a",
+      "cwd": "/home/ubuntu/r460",
+      "command": "python3 cado-nfs/cado-nfs.py {N} tasks.polyselect.import={POLY} {BASE_SIEVE_OVERRIDES} {QWIN_A} tasks.threads=24",
+      "metrics": {
+        "rels_per_sq": "(?P<value>[0-9]+(?:\\.[0-9]+)?)r/sq",
+        "sec_per_rel": "(?P<value>[0-9]+(?:\\.[0-9]+)?)s/r"
+      }
+    },
+    {
+      "name": "baseline-gcc-v3-qwin-b",
+      "cwd": "/home/ubuntu/r460",
+      "command": "python3 cado-nfs/cado-nfs.py {N} tasks.polyselect.import={POLY} {BASE_SIEVE_OVERRIDES} {QWIN_B} tasks.threads=24",
+      "metrics": {
+        "rels_per_sq": "(?P<value>[0-9]+(?:\\.[0-9]+)?)r/sq",
+        "sec_per_rel": "(?P<value>[0-9]+(?:\\.[0-9]+)?)s/r"
+      }
+    },
+    {
+      "name": "batch-cofac-gcc-v3-qwin-a",
+      "cwd": "/home/ubuntu/r460",
+      "command": "python3 cado-nfs/cado-nfs.py {N} tasks.polyselect.import={POLY} {BASE_SIEVE_OVERRIDES} {QWIN_A} tasks.threads=24 tasks.sieve.las.batch=true tasks.batchlpb0=28 tasks.batchlpb1=28 tasks.batchmfb0=62 tasks.batchmfb1=62",
+      "metrics": {
+        "rels_per_sq": "(?P<value>[0-9]+(?:\\.[0-9]+)?)r/sq",
+        "sec_per_rel": "(?P<value>[0-9]+(?:\\.[0-9]+)?)s/r"
+      }
+    },
+    {
+      "name": "compsq-gcc-v3-qwin-a",
+      "cwd": "/home/ubuntu/r460",
+      "command": "python3 cado-nfs/cado-nfs.py {N} tasks.polyselect.import={POLY} {BASE_SIEVE_OVERRIDES} {QWIN_A} tasks.threads=24 tasks.sieve.allow_compsq=true tasks.sieve.qfac_min=50 tasks.sieve.qfac_max=100000",
+      "metrics": {
+        "rels_per_sq": "(?P<value>[0-9]+(?:\\.[0-9]+)?)r/sq",
+        "sec_per_rel": "(?P<value>[0-9]+(?:\\.[0-9]+)?)s/r"
+      }
+    },
+    {
+      "name": "threads-20-gcc-v3-qwin-a",
+      "cwd": "/home/ubuntu/r460",
+      "command": "python3 cado-nfs/cado-nfs.py {N} tasks.polyselect.import={POLY} {BASE_SIEVE_OVERRIDES} {QWIN_A} tasks.threads=20",
+      "metrics": {
+        "rels_per_sq": "(?P<value>[0-9]+(?:\\.[0-9]+)?)r/sq",
+        "sec_per_rel": "(?P<value>[0-9]+(?:\\.[0-9]+)?)s/r"
+      }
+    }
+  ]
+}
