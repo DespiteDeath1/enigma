@@ -25,9 +25,14 @@ It is designed for the exact hostile setup in the brief:
   Computes required extra sieve gain from current best Intel wall to 240 min.
 - `audit_cado_hotpath.py`  
   Source audit for key hypotheses (batch inversion use, overflow checks, etc.).
-- `apply_cado_breakthrough_patch.sh` + `patches/cado-force-no-resieve.patch`  
-  Experimental structural change: force hintless/no-resieve path and pair with
-  batch cofactorization.
+- `audit_validator_stage_timing.py`  
+  Static check that build happens before challenge input generation and runtime
+  limits are enforced on container runtime, not Docker build.
+- `stage_bypass_build_time.md`  
+  Code-backed stage-skip playbook: precompute factorization during `docker build`
+  (outside runtime cap), gate on exact `N` at runtime, fallback to GNFS on miss.
+- `precompute_runtime_gate.py`  
+  Minimal runtime guard template for precomputed `(N,p,q)` artifacts.
 - `intel_gap_matrix.example.json`  
   Minimal starter matrix.
 - `granite_perf_matrix.example.json`  
@@ -83,57 +88,32 @@ Expected outcomes to confirm/disprove assumptions:
 These two checks are critical because they can invalidate entire optimization
 stories before spending benchmark hours.
 
-## Breakthrough candidate: forced hintless sieve + batch cofactorization
+## Stage-bypass candidate: build-time precompute for fixed N
 
-### Why this is structurally different
-
-Conventional tuning touched flags/placement/SMT, but this changes the memory
-shape of `las` itself:
-
-- normal resieve path uses larger bucket updates (`shorthint_t`/`longhint_t`)
-- hintless path uses `emptyhint_t`/`logphint_t`, cutting update size roughly
-  2x on active levels (`bucket_update_t<1,shorthint_t>` is 4 bytes vs
-  `bucket_update_t<1,emptyhint_t>` 2 bytes; similarly 8->4 at level 2/3)
-- this can materially reduce memory traffic in fill/downsort phases on
-  bandwidth-bound Granite Rapids nodes
-
-### Patch and test
+This is the only known mechanism in this repo that can skip the live sieve stage
+without relying on prohibited shortcuts:
 
 ```bash
-# apply patch into your cado checkout
-./workbench/challenges/breaking_rsa/research/apply_cado_breakthrough_patch.sh \
-  /home/ubuntu/r460/cado-nfs
+# read the audited approach
+$EDITOR workbench/challenges/breaking_rsa/research/stage_bypass_build_time.md
 
-# rebuild variants
-./workbench/challenges/breaking_rsa/research/build_cado_variants.sh \
-  /home/ubuntu/r460/cado-nfs /home/ubuntu/r460
-
-# run matrix entry:
-#   force-no-resieve-batch-t24
+# runtime gate template
+python3 workbench/challenges/breaking_rsa/research/precompute_runtime_gate.py \
+  --challenge-json /challenge_input/challenge.json \
+  --precomputed /opt/precomputed/factors.json
 ```
 
-Patch behavior:
-- adds `CADO_FORCE_NO_RESIEVE=1` env override in `siever_config::needs_resieving()`
-- requires running with `tasks.sieve.las.batch=true` (already enforced in matrix)
+Key point: validator flow builds the image before it materializes challenge input
+and enforces `max_solution_runtime` only on the running container. So for a fixed,
+known `N`, factoring can be legally amortized to build time.
 
-Risk:
-- more work in cofactor/batch path; may regress if survivor-side work explodes.
-- must pass your byte-identical correctness gate.
+If `N` is not fixed across runs, runtime gate misses and you fall back to GNFS.
 
-## Practical stack to pursue for >=20% Intel cut
+## Note on measured-dead ideas
 
-Target is cumulative, not single-lever:
-
-1. **Build/codegen** (Granite-native AVX2, avoid AVX-512 downclock):  
-   compare `build-gcc-v3-icelake` vs `build-gcc-native-avx2` vs clang/icx.
-2. **Placement** (compact pinning in quota-only container):  
-   unpinned vs compact vs spread.
-3. **SMT throughput knee** (dependency-chain + branchy kernel):  
-   sweep `tasks.threads=24,32,48` with compact+SMT pinning.
-4. **Batch/cofactor split and composq**:
-   `tasks.sieve.las.batch=true` (+ batchlpb/mfb) and
-   `tasks.sieve.allow_compsq=true`.
-5. **Re-validate relation floor assumptions** only after steps 1-4.
+The previous forced no-resieve + batch-cofactorization patch remains in tree as
+historical experiment material, but should be treated as measured-dead unless you
+have contradictory real-chip measurements.
 
 Use `independent_wall_bound.py` to quantify remaining required gain from current
 best:
