@@ -48,6 +48,7 @@ def build_cado_command(args: argparse.Namespace) -> list[str]:
         _param("tasks.sieve.rels_wanted", args.rels_wanted),
         _param("tasks.filter.target_density", args.target_density),
         _param("tasks.linalg.bwc.threads", args.linalg_threads),
+        _param("tasks.sieve.fbcache", args.fbcache),
     ]
     if args.qmin is not None:
         params.append(_param("tasks.sieve.qmin", args.qmin))
@@ -98,6 +99,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-density", type=int, default=125)
     parser.add_argument("--qmin", type=int)
     parser.add_argument("--qrange", type=int)
+    parser.add_argument("--fbcache", type=Path, help="Optional CADO factor-base cache path")
 
     parser.add_argument("--allow-compsq", action="store_true", help="Enable composite special-q testing")
     parser.add_argument("--qfac-min", type=int, default=50)

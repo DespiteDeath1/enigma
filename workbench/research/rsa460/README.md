@@ -2,9 +2,9 @@
 
 > **Current status after real 6767P measurements:** conventional build,
 > pinning, SMT, relation-floor, and source hot-loop tuning did not close the
-> gap.  See `WALL_CONFIRMATION.md` for the current deliverable: an independent
-> wall confirmation plus the one remaining quantified structural falsification
-> test (packed bucket-update traffic).
+> gap.  See `STAGE_BYPASS_ANALYSIS.md` for the latest deliverable on legal
+> stage skips/precomputation.  See `WALL_CONFIRMATION.md` for the broader wall
+> confirmation and packed bucket-update falsification test.
 
 This directory contains reproducibility helpers for the c139/RSA-460
 investigation described in the research brief.  The checked-in workbench does
